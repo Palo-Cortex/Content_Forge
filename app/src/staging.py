@@ -1,42 +1,54 @@
 from __future__ import annotations
 
-import os
 import shutil
-import subprocess
+import json
 from pathlib import Path
 from typing import List
 
 
 def ensure_staging_pack(repo_dir: Path, staging_pack: str) -> Path:
     """
-    Ensure a valid pack skeleton exists so demisto-sdk validate can run on it.
-    Creates Packs/<staging_pack> via demisto-sdk init if missing.
+    Ensure a valid staging pack skeleton exists.
+    Pure filesystem creation. No demisto-sdk init.
     """
+
     packs_root = repo_dir / "Packs"
     pack_root = packs_root / staging_pack
 
     packs_root.mkdir(parents=True, exist_ok=True)
+    pack_root.mkdir(parents=True, exist_ok=True)
 
-    if not pack_root.exists():
-        env = os.environ.copy()
-        env["DEMISTO_SDK_CONTENT_PATH"] = str(repo_dir)
-        env.setdefault("DEMISTO_SDK_IGNORE_CONTENT_WARNING", "true")
-
-        # demisto-sdk init creates pack skeleton under Packs/<pack>.
-        # If your SDK uses different flags, the error output will show the correct usage.
-        cmd = ["demisto-sdk", "init", "--pack", staging_pack]
-        p = subprocess.run(
-            cmd,
-            cwd=str(repo_dir),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        if p.returncode != 0:
-            raise RuntimeError(f"Failed to init staging pack:\n{p.stdout}")
-
+    # Required subfolders
     (pack_root / "Playbooks").mkdir(parents=True, exist_ok=True)
+    (pack_root / "ReleaseNotes").mkdir(parents=True, exist_ok=True)
+
+    # Required pack_metadata.json (PA107 compliant)
+    pack_meta = pack_root / "pack_metadata.json"
+
+    metadata = {
+        "name": staging_pack,
+        "description": "Auto-generated staging pack",
+        "support": "xsoar",
+        "currentVersion": "1.0.0",
+        "author": "Content Forge",
+        "url": "https://internal.local/staging",
+        "categories": ["Security"],
+        "tags": ["SOC"],
+        "useCases": ["SOC"],
+        "keywords": ["SOC", "Automation"],
+        "marketplaces": ["xsoar", "marketplacev2"]
+    }
+
+    pack_meta.write_text(
+        json.dumps(metadata, indent=2),
+        encoding="utf-8"
+    )
+
+    # Required support files
+    (pack_root / "README.md").touch(exist_ok=True)
+    (pack_root / ".pack-ignore").touch(exist_ok=True)
+    (pack_root / ".secrets-ignore").touch(exist_ok=True)
+
     return pack_root
 
 
