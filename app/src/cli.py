@@ -61,7 +61,10 @@ def doctor() -> int:
 
     staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
     staged_playbooks = _stage_fresh_playbooks(staging_root)
-    repo_playbooks = iter_playbook_files(REPO_DIR)  # repo-wide now that repo_index is fixed
+    repo_playbooks = [
+        p for p in iter_playbook_files(REPO_DIR)
+        if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
+    ]
     pack_playbooks = iter_playbook_files(pack_root)
 
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
@@ -164,7 +167,7 @@ def fix() -> int:
 # Promote (safe promotion with diff + optional force)
 # ------------------------------------------------------------
 
-def promote(force: bool = False) -> int:
+def promote(force: bool = False, dry_run: bool = False) -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pack_root = REPO_DIR / "Packs" / TARGET_PACK
@@ -223,15 +226,20 @@ def promote(force: bool = False) -> int:
     # --------------------------------------------------
     # Repository Graph Integrity Check (SIMULATED)
     # --------------------------------------------------
+    # --------------------------------------------------
+    # Repository Graph Integrity Check (SIMULATED)
+    # --------------------------------------------------
     print("Running repository graph integrity check...")
 
     before_graph = build_repo_graph(REPO_DIR)
 
     temp_repo = simulate_repo_with_staging(REPO_DIR, staging_root)
-    after_graph = build_repo_graph(temp_repo)
 
     # ---- Apply ID→Name mapping to impacted playbooks in the TEMP repo ----
-    repo_playbooks = iter_playbook_files(REPO_DIR)
+    repo_playbooks = [
+        p for p in iter_playbook_files(REPO_DIR)
+        if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
+    ]
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
     old_ids = set(id_map.keys())
 
@@ -248,10 +256,53 @@ def promote(force: bool = False) -> int:
         if tp.exists():
             temp_impacted.append(tp)
 
+    dependent_changes = []
     if temp_impacted and id_map:
-        apply_mapping_across_files(temp_impacted, id_map)
+        dependent_changes = apply_mapping_across_files(temp_impacted, id_map)
 
-    broken = compare_graphs(before_graph, after_graph)
+    # ---- Write reports for visibility ----
+    impacted_report = {
+        "id_map_count": len(id_map),
+        "impacted_repo_playbooks_count": len(impacted_repo_playbooks),
+        "impacted_repo_playbooks": [str(p) for p in impacted_repo_playbooks],
+        "temp_impacted_count": len(temp_impacted),
+        "temp_impacted": [str(p) for p in temp_impacted],
+        "dependent_changes_count": len(dependent_changes),
+    }
+    (OUTPUT_DIR / "impacted_dependents.json").write_text(
+        json.dumps(impacted_report, indent=2),
+        encoding="utf-8",
+    )
+    (OUTPUT_DIR / "dependent_rewrite_changes.json").write_text(
+        json.dumps([c.__dict__ for c in dependent_changes], indent=2),
+        encoding="utf-8",
+    )
+
+    # ---- Policy: if dependents exist, abort unless --force ----
+    if impacted_repo_playbooks and not force and id_map:
+        print("Detected dependent playbooks that reference old IDs.")
+        print(f"Wrote: {OUTPUT_DIR / 'impacted_dependents.json'}")
+        print("ABORTING (run with --force to proceed).")
+        return 6
+
+    # IMPORTANT: Build after_graph *after* rewriting dependents in temp_repo
+    after_graph = build_repo_graph(temp_repo)
+
+    focus_nodes = set()
+
+    # staged playbooks ids
+    for pb in staged_playbooks:
+        d = parse_playbook_refs(pb)
+        if d.get("id"):
+            focus_nodes.add(str(d["id"]))
+
+    # impacted dependents ids (repo originals)
+    for p in impacted_repo_playbooks:
+        d = parse_playbook_refs(p)
+        if d.get("id"):
+            focus_nodes.add(str(d["id"]))
+
+    broken = compare_graphs(before_graph, after_graph, focus_nodes=focus_nodes)
 
     if broken:
         print("Graph integrity violation detected:")
@@ -261,7 +312,6 @@ def promote(force: bool = False) -> int:
         return 4
 
     print("Graph integrity check passed.")
-
 
     semantic_report = {}
 
@@ -329,15 +379,17 @@ def promote(force: bool = False) -> int:
     # --------------------------------------------------
     # COPY INTO REAL PACK  (REAL MUTATION POINT)
     # --------------------------------------------------
+    if dry_run:
+        print("DRY RUN: skipping copy into real pack and final pack validate.")
+        return 0
+
     real_pb_dir = pack_root / "Playbooks"
     real_pb_dir.mkdir(parents=True, exist_ok=True)
 
     for pb in staged_playbooks:
         shutil.copy2(pb, real_pb_dir / pb.name)
 
-    # --------------------------------------------------
     # Final validate
-    # --------------------------------------------------
     final_code, final_out = run_validate(REPO_DIR, f"Packs/{TARGET_PACK}")
     print(final_out)
     print(f"Final validate exit code: {final_code}")
@@ -357,13 +409,13 @@ def main() -> int:
 
     cmd = sys.argv[1].lower()
     force = "--force" in sys.argv[2:]
-
+    dry_run = "--dry-run" in sys.argv[2:]
     if cmd == "doctor":
         return doctor()
     if cmd == "fix":
         return fix()
     if cmd == "promote":
-        return promote(force=force)
+        return promote(force=force, dry_run=dry_run)
 
     print(f"Unknown command: {cmd}")
     return 2

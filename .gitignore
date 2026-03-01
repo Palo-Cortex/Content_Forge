@@ -1,4 +1,4 @@
 /.idea/
-/workspace/
-/workspace/secops-framework/
 /.venv/
+/workspace
+!/workspace/secops-framework/Packs/content-forge-fixtures/

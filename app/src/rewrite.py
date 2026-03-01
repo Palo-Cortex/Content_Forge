@@ -77,32 +77,34 @@ def apply_mapping_to_playbook(path: Path, id_map: Dict[str, str]) -> Tuple[List[
     tasks = doc.get("tasks")
     if isinstance(tasks, dict):
         for tid, task in tasks.items():
-            if not isinstance(task, dict):
-                continue
+            inner = task.get("task") if isinstance(task.get("task"), dict) else None
+            targets = [task]
+            if inner is not None:
+                targets.append(inner)
 
-            for key in ("playbookId", "playbookID", "playbookid"):
-                v = task.get(key)
-                if v is None:
-                    continue
-                vs = str(v)
-                if vs in id_map:
-                    new = id_map[vs]
-                    task[key] = new
-                    changes.append(RewriteChange(str(path), "task_playbookId", vs, new, f"tasks.{tid}.{key}"))
-                    modified = True
+            for target in targets:
+                for key in ("playbookId", "playbookID", "playbookid"):
+                    v = target.get(key)
+                    if v is None:
+                        continue
+                    vs = str(v)
+                    if vs in id_map:
+                        new = id_map[vs]
+                        target[key] = new
+                        changes.append(RewriteChange(str(path), "task_playbookId", vs, new, f"tasks.{tid}.{'task.' if target is inner else ''}{key}"))
+                        modified = True
 
-            pb_name = task.get("playbookName") or task.get("playbookname")
-            if pb_name is not None:
-                pns = str(pb_name)
-                if pns in id_map:
-                    new = id_map[pns]
-                    if "playbookName" in task:
-                        task["playbookName"] = new
-                        changes.append(RewriteChange(str(path), "task_playbookName", pns, new, f"tasks.{tid}.playbookName"))
-                    else:
-                        task["playbookname"] = new
-                        changes.append(RewriteChange(str(path), "task_playbookName", pns, new, f"tasks.{tid}.playbookname"))
-                    modified = True
+                pb_name = target.get("playbookName") or target.get("playbookname")
+                if pb_name is not None:
+                    pns = str(pb_name)
+                    if pns in id_map:
+                        new = id_map[pns]
+                        if "playbookName" in target:
+                            target["playbookName"] = new
+                        else:
+                            target["playbookname"] = new
+                        changes.append(RewriteChange(str(path), "task_playbookName", pns, new, f"tasks.{tid}.{'task.' if target is inner else ''}playbookName"))
+                        modified = True
 
     if modified:
         _dump_yaml(doc, path)

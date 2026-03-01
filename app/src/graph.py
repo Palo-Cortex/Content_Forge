@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Set
+from typing import Dict, Set, Any
 import shutil
 import tempfile
 
@@ -7,35 +7,48 @@ from app.src.playbook_refs import parse_playbook_refs
 from app.src.repo_index import iter_playbook_files
 
 
-def build_repo_graph(repo_root: Path) -> Dict[str, Dict[str, Set[str]]]:
-    graph: Dict[str, Dict[str, Set[str]]] = {}
+def build_repo_graph(repo_root: Path) -> Dict[str, Dict[str, Any]]:
+    graph: Dict[str, Dict[str, Any]] = {}
 
     for pb_path in iter_playbook_files(repo_root):
         parsed = parse_playbook_refs(pb_path)
 
-        graph[str(pb_path.relative_to(repo_root))] = {
-            "playbooks": set(parsed["refs"]["playbooks_by_id"]),
+        node_id = str(parsed.get("id") or pb_path.name)
+        graph[node_id] = {
+            "path": str(pb_path.relative_to(repo_root)),
+            "playbooks_by_id": set(parsed["refs"]["playbooks_by_id"]),
+            "playbooks_by_name": set(parsed["refs"]["playbooks_by_name"]),
             "scripts": set(parsed["refs"]["scripts"]),
         }
 
     return graph
 
+def compare_graphs(before, after, focus_nodes=None):
+    """
+    Compare dependency graphs and return only edges LOST from before->after.
 
-def compare_graphs(before, after):
+    focus_nodes: optional set of node ids to restrict the comparison (recommended).
+    """
     broken = []
 
-    for node, deps in before.items():
-        if node not in after:
+    nodes = focus_nodes if focus_nodes else before.keys()
+
+    for node in nodes:
+        if node not in before or node not in after:
             continue
 
-        lost_playbooks = deps["playbooks"] - after[node]["playbooks"]
-        lost_scripts = deps["scripts"] - after[node]["scripts"]
+        deps_before = before[node]
+        deps_after = after[node]
 
-        if lost_playbooks or lost_scripts:
+        lost_playbooks_by_id = deps_before.get("playbooks_by_id", set()) - deps_after.get("playbooks_by_id", set())
+        lost_scripts = deps_before.get("scripts", set()) - deps_after.get("scripts", set())
+
+        if lost_playbooks_by_id or lost_scripts:
             broken.append({
+                "kind": "lost_edges",
                 "node": node,
-                "lost_playbooks": list(lost_playbooks),
-                "lost_scripts": list(lost_scripts),
+                "lost_playbooks_by_id": sorted(lost_playbooks_by_id),
+                "lost_scripts": sorted(lost_scripts),
             })
 
     return broken
@@ -47,10 +60,10 @@ def simulate_repo_with_staging(repo_root: Path, staging_root: Path) -> Path:
     Returns path to temp repo.
     """
     temp_dir = Path(tempfile.mkdtemp())
+    dst = temp_dir / repo_root.name
 
-    # Copy entire repo
-    shutil.copytree(repo_root, temp_dir / repo_root.name)
-    temp_repo = temp_dir / repo_root.name
+    shutil.copytree(repo_root, dst)
+    temp_repo = dst
 
     # Overlay staging playbooks
     staging_playbooks = staging_root / "Playbooks"

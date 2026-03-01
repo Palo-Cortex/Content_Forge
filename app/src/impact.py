@@ -17,15 +17,22 @@ def find_pack_playbooks_referencing_ids(pack_playbook_files: List[Path], old_ids
         tasks = doc.get("tasks") or {}
         found = False
         if isinstance(tasks, dict):
-            for _, task in tasks.items():
-                if not isinstance(task, dict):
+            for _, t in tasks.items():
+                if not isinstance(t, dict):
                     continue
-                for key in ("playbookId", "playbookID", "playbookid"):
-                    v = task.get(key)
-                    if v is None:
-                        continue
-                    if str(v) in old_ids:
-                        found = True
+
+                inner = t.get("task") if isinstance(t.get("task"), dict) else {}
+                candidates = (t, inner)
+
+                for task in candidates:
+                    for key in ("playbookId", "playbookID", "playbookid"):
+                        v = task.get(key)
+                        if v is None:
+                            continue
+                        if str(v) in old_ids:
+                            found = True
+                            break
+                    if found:
                         break
                 if found:
                     break

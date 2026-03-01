@@ -22,31 +22,36 @@ def parse_playbook_refs(path: Path) -> Dict[str, Any]:
     scripts: Set[str] = set()
     commands: Set[str] = set()
 
-    for _, task in tasks.items():
-        if not isinstance(task, dict):
+    for _, t in tasks.items():
+        if not isinstance(t, dict):
             continue
 
-        pb_name = task.get("playbookName") or task.get("playbookname")
-        if pb_name and pb_name != "-":
-            playbooks_by_name.add(str(pb_name))
+        # XSOAR: most fields are under t["task"]
+        inner = t.get("task") if isinstance(t.get("task"), dict) else {}
+        candidates = (t, inner)
 
-        pb_id = task.get("playbookId") or task.get("playbookID") or task.get("playbookid")
-        if pb_id and pb_id != "-":
-            playbooks_by_id.add(str(pb_id))
+        for task in candidates:
+            pb_name = task.get("playbookName") or task.get("playbookname")
+            if pb_name and pb_name != "-":
+                playbooks_by_name.add(str(pb_name))
 
-        script_block = task.get("script")
-        if isinstance(script_block, dict):
-            sn = script_block.get("scriptName") or script_block.get("scriptname")
-            if sn and sn != "-":
-                scripts.add(str(sn))
+            pb_id = task.get("playbookId") or task.get("playbookID") or task.get("playbookid")
+            if pb_id and pb_id != "-":
+                playbooks_by_id.add(str(pb_id))
 
-            cmd = script_block.get("command")
-            if cmd and cmd != "-":
-                commands.add(str(cmd))
+            script_block = task.get("script")
+            if isinstance(script_block, dict):
+                sn = script_block.get("scriptName") or script_block.get("scriptname")
+                if sn and sn != "-":
+                    scripts.add(str(sn))
 
-        sn2 = task.get("scriptName") or task.get("scriptname")
-        if sn2 and sn2 != "-":
-            scripts.add(str(sn2))
+                cmd = script_block.get("command")
+                if cmd and cmd != "-":
+                    commands.add(str(cmd))
+
+            sn2 = task.get("scriptName") or task.get("scriptname")
+            if sn2 and sn2 != "-":
+                scripts.add(str(sn2))
 
     return {
         "file": str(path),
