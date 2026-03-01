@@ -28,6 +28,7 @@ class RewriteChange:
     location: str
 
 
+
 def build_id_normalization_map(playbook_files: List[Path]) -> Dict[str, str]:
     """
     Option 2: normalize playbook id -> name.

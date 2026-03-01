@@ -20,46 +20,57 @@ def strip_ansi(line: str) -> str:
 # -------------------------
 
 def fix_fromversion(file_path: Path, min_version: str):
-    lines = file_path.read_text(encoding="utf-8").splitlines()
+    try:
+        doc = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return False
 
-    for i, line in enumerate(lines):
-        if line.strip().startswith("fromversion:"):
-            lines[i] = f"fromversion: {min_version}"
-            file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if doc.get("fromversion") != min_version:
+            doc["fromversion"] = min_version
+            file_path.write_text(
+                yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
             return True
 
-    for i, line in enumerate(lines):
-        if line.strip().startswith("id:"):
-            lines.insert(i + 1, f"fromversion: {min_version}")
-            file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            return True
+        return False
 
-    return False
+    except Exception:
+        return False
 
 
 # -------------------------
 # BA101 — name must equal id
 # -------------------------
 
+import yaml
+
+
+import yaml
+
+
 def fix_id_equals_name(file_path: Path):
-    lines = file_path.read_text(encoding="utf-8").splitlines()
+    try:
+        doc = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return False
 
-    name = None
-    id_index = None
+        name = doc.get("name")
+        if not name:
+            return False
 
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("name:"):
-            name = stripped.split("name:", 1)[1].strip()
-        if stripped.startswith("id:"):
-            id_index = i
+        if doc.get("id") != name:
+            doc["id"] = name
+            file_path.write_text(
+                yaml.safe_dump(doc, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            return True
 
-    if name and id_index is not None:
-        lines[id_index] = f"id: {name}"
-        file_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        return True
+        return False
 
-    return False
+    except Exception:
+        return False
 
 
 # -------------------------

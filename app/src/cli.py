@@ -14,19 +14,29 @@ from app.src.repo_index import build_symbol_table, iter_playbook_files
 from app.src.rewrite import apply_mapping_across_files, build_id_normalization_map
 from app.src.sdk_gate import run_validate
 from app.src.staging import ensure_staging_pack, stage_ingest_playbooks
+from app.src.diff import hash_playbooks, compute_diff
+from app.src.integrity import analyze_playbook_integrity
+from app.src.semantic_diff import snapshot_playbook, semantic_diff
+from app.src.graph import (
+    build_repo_graph,
+    compare_graphs,
+    simulate_repo_with_staging,
+)
 
-REPO_DIR = Path(os.environ.get("REPO_DIR", "/workspace/secops-framework"))
-INGEST_DIR = Path(os.environ.get("INGEST_DIR", "/workspace/ingest"))
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/workspace/output"))
+BASE_DIR = Path(os.environ.get("BASE_DIR", Path.cwd()))
+
+REPO_DIR = Path(os.environ.get("REPO_DIR", BASE_DIR / "secops-framework"))
+INGEST_DIR = Path(os.environ.get("INGEST_DIR", BASE_DIR / "ingest"))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", BASE_DIR / "output"))
 TARGET_PACK = os.environ.get("TARGET_PACK", "soc-optimization-unified")
 STAGING_PACK = os.environ.get("STAGING_PACK", f"{TARGET_PACK}_ingest")
 
 
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
 def _stage_fresh_playbooks(staging_root: Path) -> list[Path]:
-    """
-    Recreate staging Playbooks/ from INGEST_DIR and return staged YAML paths.
-    This is the ONLY place we delete/recreate staging Playbooks.
-    """
     staging_playbooks_dir = staging_root / "Playbooks"
 
     if staging_playbooks_dir.exists():
@@ -34,9 +44,12 @@ def _stage_fresh_playbooks(staging_root: Path) -> list[Path]:
     staging_playbooks_dir.mkdir(parents=True, exist_ok=True)
 
     staged_files = stage_ingest_playbooks(INGEST_DIR, staging_playbooks_dir)
-    staged_playbooks = [p for p in staged_files if is_playbook_yaml(p)]
-    return staged_playbooks
+    return [p for p in staged_files if is_playbook_yaml(p)]
 
+
+# ------------------------------------------------------------
+# Doctor (analysis only, no mutation)
+# ------------------------------------------------------------
 
 def doctor() -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,7 +61,6 @@ def doctor() -> int:
 
     staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
     staged_playbooks = _stage_fresh_playbooks(staging_root)
-
     pack_playbooks = iter_playbook_files(pack_root)
 
     id_map = build_id_normalization_map(pack_playbooks + staged_playbooks)
@@ -84,30 +96,22 @@ def doctor() -> int:
             "impacted_pack_playbooks": len(impacted_pack_playbooks),
             "missing_refs": len(missing),
         },
-        "id_map_sample": list(id_map.items())[:25],
-        "impacted_pack_playbooks": [str(p) for p in impacted_pack_playbooks],
         "missing": missing,
     }
 
     out = OUTPUT_DIR / "doctor_report.json"
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
     print(f"Wrote: {out}")
-    print(f"Staged playbooks: {len(staged_playbooks)}")
-    print(f"ID mappings: {len(id_map)}")
-    print(f"Impacted pack playbooks: {len(impacted_pack_playbooks)}")
     print(f"Missing refs: {len(missing)}")
     return 0
 
 
+# ------------------------------------------------------------
+# Fix (mutates staging only)
+# ------------------------------------------------------------
+
 def fix() -> int:
-    """
-    The ONLY command that mutates staging content.
-    - stages fresh from ingest
-    - normalizes IDs / names and other rewrites
-    - runs validate
-    - runs internal fixer (run_fixes) using validate output
-    - re-validates
-    """
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pack_root = REPO_DIR / "Packs" / TARGET_PACK
@@ -118,34 +122,20 @@ def fix() -> int:
     staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
     staged_playbooks = _stage_fresh_playbooks(staging_root)
 
-    # Build id normalization map using real pack + staged playbooks
     pack_playbooks = iter_playbook_files(pack_root)
     id_map = build_id_normalization_map(pack_playbooks + staged_playbooks)
 
-    # Rewrite staged playbooks (ID/name normalization etc.)
+    if id_map:
+        print("\nID Normalization Map:")
+        for old, new in id_map.items():
+            print(f"  {old}  →  {new}")
+    else:
+        print("\nNo UUID → name normalization needed.")
+
     apply_mapping_across_files(staged_playbooks, id_map)
 
-    # Copy impacted pack playbooks into staging, rewrite copies (so validate sees consistent refs)
-    old_ids = set(id_map.keys())
-    impacted_pack_playbooks = find_pack_playbooks_referencing_ids(pack_playbooks, old_ids)
-
-    staged_impacted_dir = staging_root / "_impacted_pack_playbooks"
-    if staged_impacted_dir.exists():
-        shutil.rmtree(staged_impacted_dir)
-    staged_impacted_dir.mkdir(parents=True, exist_ok=True)
-
-    impacted_copies: list[Path] = []
-    for pb in impacted_pack_playbooks:
-        dest = staged_impacted_dir / Path(pb).name
-        shutil.copy2(pb, dest)
-        impacted_copies.append(dest)
-
-    apply_mapping_across_files(impacted_copies, id_map)
-
-    # Normalize pack metadata / required files etc. before validate
     normalize_pack(staging_root, staged_playbooks)
 
-    # Validate staging pack
     code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
     (OUTPUT_DIR / "fix_validate_output.txt").write_text(validate_out, encoding="utf-8")
 
@@ -153,29 +143,26 @@ def fix() -> int:
         print("Nothing to fix. Staging validate clean.")
         return 0
 
-    # Run internal fixer against validate output (BA106 etc.)
     print("Running internal fixer...")
     changed = run_fixes(REPO_DIR, validate_out)
     print(f"Files modified: {changed}")
 
-    # Re-validate
     code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
     (OUTPUT_DIR / "fix_validate_output_after.txt").write_text(validate_out, encoding="utf-8")
 
     if code != 0:
         print("Still failing after fix.")
-        print(f"See: {OUTPUT_DIR / 'fix_validate_output_after.txt'}")
         return code
 
     print("Fix successful. Staging pack clean.")
     return 0
 
 
-def promote() -> int:
-    """
-    Promote assumes staging is already prepared (typically by `fix`).
-    It DOES NOT restage from ingest, and DOES NOT re-run fixers.
-    """
+# ------------------------------------------------------------
+# Promote (safe promotion with diff + optional force)
+# ------------------------------------------------------------
+
+def promote(force: bool = False) -> int:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pack_root = REPO_DIR / "Packs" / TARGET_PACK
@@ -186,48 +173,174 @@ def promote() -> int:
     staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
     staging_playbooks_dir = staging_root / "Playbooks"
 
-    if not staging_playbooks_dir.exists() or not any(staging_playbooks_dir.glob("*.yml")):
-        print("[ERROR] Staging Playbooks are missing/empty. Run `fix` first.")
+    if not staging_playbooks_dir.exists():
+        print("[ERROR] Staging Playbooks missing. Run `fix` first.")
         return 2
 
-    staged_playbooks = [p for p in staging_playbooks_dir.glob("*.yml") if is_playbook_yaml(p)]
+    staged_playbooks = [
+        p for p in staging_playbooks_dir.glob("*.yml") if is_playbook_yaml(p)
+    ]
 
-    # Validate staging pack (again) before touching real pack
+    # --------------------------------------------------
+    # Validate staging pack
+    # --------------------------------------------------
     code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
-    (OUTPUT_DIR / "staging_validate_output.txt").write_text(validate_out, encoding="utf-8")
-
     if code != 0:
-        print("Staging validate FAILED. Not touching real pack.")
-        print(f"See: {OUTPUT_DIR / 'staging_validate_output.txt'}")
+        print("Staging validate FAILED. Run fix first.")
         return code
 
-    # Promote staged playbooks into real pack
+    # --------------------------------------------------
+    # Diff safety
+    # --------------------------------------------------
+    before_hashes = hash_playbooks(pack_root)
+    after_hashes = hash_playbooks(staging_root)
+
+    diff = compute_diff(before_hashes, after_hashes)
+    total_changes = len(diff["added"]) + len(diff["modified"])
+
+    diff_report = {
+        "added": diff["added"],
+        "modified": diff["modified"],
+        "unchanged": diff["unchanged"],
+        "total_changes": total_changes,
+    }
+
+    diff_path = OUTPUT_DIR / "promotion_diff.json"
+    diff_path.write_text(json.dumps(diff_report, indent=2), encoding="utf-8")
+
+    print(f"Promotion diff written to: {diff_path}")
+    print(f"Total Changes: {total_changes}")
+
+    MAX_ALLOWED_CHANGES = 20
+
+    if total_changes > MAX_ALLOWED_CHANGES and not force:
+        print(f"ABORTING: Too many changes ({total_changes})")
+        print("Re-run with --force to override.")
+        return 3
+
+    # --------------------------------------------------
+    # Repository Graph Integrity Check (SIMULATED)
+    # --------------------------------------------------
+    print("Running repository graph integrity check...")
+
+    before_graph = build_repo_graph(REPO_DIR)
+
+    temp_repo = simulate_repo_with_staging(REPO_DIR, staging_root)
+    after_graph = build_repo_graph(temp_repo)
+
+    broken = compare_graphs(before_graph, after_graph)
+
+    if broken:
+        print("Graph integrity violation detected:")
+        for b in broken:
+            print(b)
+        print("ABORTING due to broken dependency edges.")
+        return 4
+
+    print("Graph integrity check passed.")
+
+
+    semantic_report = {}
+
+    for pb in staged_playbooks:
+        real_path = pack_root / "Playbooks" / pb.name
+
+        if real_path.exists():
+            before_snap = snapshot_playbook(real_path)
+            after_snap = snapshot_playbook(pb)
+
+            diff = semantic_diff(before_snap, after_snap)
+
+            if any(
+                    diff[k]
+                    for k in diff
+            ):
+                semantic_report[pb.name] = diff
+        else:
+            semantic_report[pb.name] = {"new_playbook": True}
+
+    semantic_path = OUTPUT_DIR / "semantic_diff.json"
+    semantic_path.write_text(
+        json.dumps(semantic_report, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"Semantic diff written to: {semantic_path}")
+
+
+    # --------------------------------------------------
+    # Playbook Integrity Check
+    # --------------------------------------------------
+    print("Running playbook integrity checks...")
+
+    integrity_report = {}
+    hard_fail = False
+
+    for pb in staged_playbooks:
+        real_path = pack_root / "Playbooks" / pb.name
+
+        if real_path.exists():
+            integrity = analyze_playbook_integrity(real_path, pb)
+
+            # Hard fail condition
+            if integrity.get("dangling_old_id_reference"):
+                hard_fail = True
+
+            # Record if anything interesting changed
+            if any(integrity.values()):
+                integrity_report[pb.name] = integrity
+
+    integrity_path = OUTPUT_DIR / "integrity_report.json"
+    integrity_path.write_text(
+        json.dumps(integrity_report, indent=2),
+        encoding="utf-8"
+    )
+
+    print(f"Integrity report written to: {integrity_path}")
+
+    if hard_fail:
+        print("ABORTING: Dangling old playbook ID detected.")
+        return 5
+
+
+    # --------------------------------------------------
+    # COPY INTO REAL PACK  (REAL MUTATION POINT)
+    # --------------------------------------------------
     real_pb_dir = pack_root / "Playbooks"
     real_pb_dir.mkdir(parents=True, exist_ok=True)
 
     for pb in staged_playbooks:
         shutil.copy2(pb, real_pb_dir / pb.name)
 
-    # Final validate on real pack
+    # --------------------------------------------------
+    # Final validate
+    # --------------------------------------------------
     final_code, final_out = run_validate(REPO_DIR, f"Packs/{TARGET_PACK}")
-    (OUTPUT_DIR / "final_validate_output.txt").write_text(final_out, encoding="utf-8")
     print(final_out)
     print(f"Final validate exit code: {final_code}")
+
     return final_code
 
 
+# ------------------------------------------------------------
+# Entry
+# ------------------------------------------------------------
+
 def main() -> int:
     if len(sys.argv) < 2:
-        print("Usage: python -m app.src.cli <command>\nCommands: doctor, fix, promote")
+        print("Usage: python -m app.src.cli <command> [--force]")
+        print("Commands: doctor, fix, promote")
         return 2
 
     cmd = sys.argv[1].lower()
+    force = "--force" in sys.argv[2:]
+
     if cmd == "doctor":
         return doctor()
     if cmd == "fix":
         return fix()
     if cmd == "promote":
-        return promote()
+        return promote(force=force)
 
     print(f"Unknown command: {cmd}")
     return 2
