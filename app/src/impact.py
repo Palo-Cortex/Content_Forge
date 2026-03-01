@@ -2,12 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Set
-import yaml
 
 
-def _load_yaml(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+from app.src.yaml_utils import load_yaml as _load_yaml
 
 
 def find_pack_playbooks_referencing_ids(pack_playbook_files: List[Path], old_ids: Set[str]) -> List[Path]:

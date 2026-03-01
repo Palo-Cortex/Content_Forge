@@ -1,9 +1,9 @@
 from app.src.playbook_refs import parse_playbook_refs
-import yaml
 
 
 def snapshot_playbook(path):
-    data = yaml.safe_load(path.read_text())
+    from app.src.yaml_utils import load_yaml
+    data = load_yaml(path)
 
     parsed = parse_playbook_refs(path)
 

@@ -21,7 +21,8 @@ def strip_ansi(line: str) -> str:
 
 def fix_fromversion(file_path: Path, min_version: str):
     try:
-        doc = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        from app.src.yaml_utils import load_yaml
+        doc = load_yaml(file_path)
         if not isinstance(doc, dict):
             return False
 
@@ -42,16 +43,13 @@ def fix_fromversion(file_path: Path, min_version: str):
 # -------------------------
 # BA101 — name must equal id
 # -------------------------
-
-import yaml
-
-
 import yaml
 
 
 def fix_id_equals_name(file_path: Path):
     try:
-        doc = yaml.safe_load(file_path.read_text(encoding="utf-8"))
+        from app.src.yaml_utils import load_yaml
+        doc = load_yaml(file_path)
         if not isinstance(doc, dict):
             return False
 

@@ -3,9 +3,18 @@ import yaml
 
 
 def analyze_playbook_integrity(before_path, after_path):
-    before = yaml.safe_load(before_path.read_text())
     after_text = after_path.read_text()
-    after = yaml.safe_load(after_text)
+
+    from app.src.yaml_utils import load_yaml
+    from app.src.yaml_utils import IgnoreUnknownLoader  # optional if you want text parsing
+
+    before = load_yaml(before_path)
+
+    # after_text is a string; easiest is to write a tiny helper
+    import yaml
+    after = yaml.load(after_text, Loader=IgnoreUnknownLoader) or {}
+    if not isinstance(after, dict):
+        after = {}
 
     report = {}
 

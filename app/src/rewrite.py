@@ -1,17 +1,20 @@
-from __future__ import annotations
-
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
-import yaml
 
-UUIDISH = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+import yaml  # <-- you need this for safe_dump
+
+from app.src.yaml_utils import load_yaml as _load_yaml
 
 
-def _load_yaml(path: Path) -> dict:
-    with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+UUIDISH = re.compile(
+    r"^[0-9a-fA-F]{8}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{12}$"
+)
 
 
 def _dump_yaml(doc: dict, path: Path) -> None:
@@ -28,10 +31,9 @@ class RewriteChange:
     location: str
 
 
-
 def build_id_normalization_map(playbook_files: List[Path]) -> Dict[str, str]:
     """
-    Option 2: normalize playbook id -> name.
+    Normalize playbook id -> name.
     Map old_id -> playbook_name for any playbook where id != name.
     """
     mapping: Dict[str, str] = {}
@@ -41,13 +43,20 @@ def build_id_normalization_map(playbook_files: List[Path]) -> Dict[str, str]:
         name = doc.get("name")
         if not pid or not name:
             continue
+
         pid_s = str(pid)
         name_s = str(name)
+
         if pid_s == name_s:
             continue
-        # Prefer UUID-ish, but keep it for any mismatch (your call).
-        if UUIDISH.match(pid_s) or True:
+
+        # Keep only UUID-ish ids (recommended) OR map all mismatches (set to True).
+        if UUIDISH.match(pid_s):
             mapping[pid_s] = name_s
+
+        # If you truly want *all* mismatches, replace the above with:
+        # mapping[pid_s] = name_s
+
     return mapping
 
 

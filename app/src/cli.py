@@ -61,14 +61,16 @@ def doctor() -> int:
 
     staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
     staged_playbooks = _stage_fresh_playbooks(staging_root)
+    repo_playbooks = iter_playbook_files(REPO_DIR)  # repo-wide now that repo_index is fixed
     pack_playbooks = iter_playbook_files(pack_root)
 
-    id_map = build_id_normalization_map(pack_playbooks + staged_playbooks)
+    id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
     old_ids = set(id_map.keys())
-    impacted_pack_playbooks = find_pack_playbooks_referencing_ids(pack_playbooks, old_ids)
+
+    impacted_repo_playbooks = find_pack_playbooks_referencing_ids(repo_playbooks, old_ids)
 
     missing: list[dict] = []
-    symbol_table = build_symbol_table(pack_root)
+    symbol_table = build_symbol_table(REPO_DIR)   # or REPO_DIR / "Packs"
 
     for pb in staged_playbooks:
         parsed = parse_playbook_refs(pb)
@@ -93,7 +95,7 @@ def doctor() -> int:
             "staged_playbooks": len(staged_playbooks),
             "pack_playbooks": len(pack_playbooks),
             "id_mappings": len(id_map),
-            "impacted_pack_playbooks": len(impacted_pack_playbooks),
+            "impacted_repo_playbooks": len(impacted_repo_playbooks),
             "missing_refs": len(missing),
         },
         "missing": missing,
@@ -227,6 +229,27 @@ def promote(force: bool = False) -> int:
 
     temp_repo = simulate_repo_with_staging(REPO_DIR, staging_root)
     after_graph = build_repo_graph(temp_repo)
+
+    # ---- Apply ID→Name mapping to impacted playbooks in the TEMP repo ----
+    repo_playbooks = iter_playbook_files(REPO_DIR)
+    id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
+    old_ids = set(id_map.keys())
+
+    impacted_repo_playbooks = find_pack_playbooks_referencing_ids(repo_playbooks, old_ids)
+
+    # Map impacted real paths to their equivalents in temp_repo and rewrite there
+    temp_impacted: list[Path] = []
+    for p in impacted_repo_playbooks:
+        try:
+            rel = p.relative_to(REPO_DIR)
+        except ValueError:
+            continue
+        tp = temp_repo / rel
+        if tp.exists():
+            temp_impacted.append(tp)
+
+    if temp_impacted and id_map:
+        apply_mapping_across_files(temp_impacted, id_map)
 
     broken = compare_graphs(before_graph, after_graph)
 
