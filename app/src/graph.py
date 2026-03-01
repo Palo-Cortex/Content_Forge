@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Dict, Set, Any
+from typing import Any, Dict
 import shutil
 import tempfile
 
@@ -8,6 +10,10 @@ from app.src.repo_index import iter_playbook_files
 
 
 def build_repo_graph(repo_root: Path) -> Dict[str, Dict[str, Any]]:
+    """
+    Graph keyed by playbook id (fallback to filename).
+    Values contain dependency sets discovered from playbook tasks.
+    """
     graph: Dict[str, Dict[str, Any]] = {}
 
     for pb_path in iter_playbook_files(repo_root):
@@ -23,14 +29,13 @@ def build_repo_graph(repo_root: Path) -> Dict[str, Dict[str, Any]]:
 
     return graph
 
+
 def compare_graphs(before, after, focus_nodes=None):
     """
-    Compare dependency graphs and return only edges LOST from before->after.
-
-    focus_nodes: optional set of node ids to restrict the comparison (recommended).
+    Only checks LOST edges from before -> after.
+    This avoids false positives from legacy/missing/marketplace refs across the repo.
     """
     broken = []
-
     nodes = focus_nodes if focus_nodes else before.keys()
 
     for node in nodes:
@@ -56,8 +61,8 @@ def compare_graphs(before, after, focus_nodes=None):
 
 def simulate_repo_with_staging(repo_root: Path, staging_root: Path) -> Path:
     """
-    Create a temp copy of repo_root and overlay staged playbooks.
-    Returns path to temp repo.
+    Create a temp copy of repo_root and overlay staged playbooks into the target pack.
+    Returns the temp repo path.
     """
     temp_dir = Path(tempfile.mkdtemp())
     dst = temp_dir / repo_root.name
@@ -65,12 +70,10 @@ def simulate_repo_with_staging(repo_root: Path, staging_root: Path) -> Path:
     shutil.copytree(repo_root, dst)
     temp_repo = dst
 
-    # Overlay staging playbooks
     staging_playbooks = staging_root / "Playbooks"
     if staging_playbooks.exists():
         target_pack = staging_root.name.replace("_ingest", "")
         target_dir = temp_repo / "Packs" / target_pack / "Playbooks"
-
         target_dir.mkdir(parents=True, exist_ok=True)
 
         for pb in staging_playbooks.glob("*.yml"):

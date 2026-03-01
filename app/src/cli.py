@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import shutil
@@ -17,6 +15,7 @@ from app.src.staging import ensure_staging_pack, stage_ingest_playbooks
 from app.src.diff import hash_playbooks, compute_diff
 from app.src.integrity import analyze_playbook_integrity
 from app.src.semantic_diff import snapshot_playbook, semantic_diff
+from app.src.platform_allowlist import DEFAULT_ALLOWLIST
 from app.src.graph import (
     build_repo_graph,
     compare_graphs,
@@ -61,11 +60,12 @@ def doctor() -> int:
 
     staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
     staged_playbooks = _stage_fresh_playbooks(staging_root)
+
+    pack_playbooks = list(iter_playbook_files(pack_root))
     repo_playbooks = [
-        p for p in iter_playbook_files(REPO_DIR)
+        p for p in list(iter_playbook_files(REPO_DIR))
         if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
     ]
-    pack_playbooks = iter_playbook_files(pack_root)
 
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
     old_ids = set(id_map.keys())
@@ -73,7 +73,17 @@ def doctor() -> int:
     impacted_repo_playbooks = find_pack_playbooks_referencing_ids(repo_playbooks, old_ids)
 
     missing: list[dict] = []
-    symbol_table = build_symbol_table(REPO_DIR)   # or REPO_DIR / "Packs"
+    platform_refs: list[dict] = []
+    external_refs: list[dict] = []
+
+    allow = DEFAULT_ALLOWLIST
+    symbol_table = build_symbol_table(REPO_DIR / "Packs")
+
+    # Backwards-compatible aliases (doctor may reference these names)
+    allow = DEFAULT_ALLOWLIST
+    PLATFORM_SCRIPTS = allow.platform_scripts
+    EXTERNAL_PLAYBOOKS_BY_NAME = allow.external_playbooks_by_name
+
 
     for pb in staged_playbooks:
         parsed = parse_playbook_refs(pb)
@@ -83,10 +93,16 @@ def doctor() -> int:
                 missing.append({"file": str(pb), "type": "playbook_id", "ref": sub_id})
 
         for sub_name in parsed["refs"]["playbooks_by_name"]:
+            if sub_name in EXTERNAL_PLAYBOOKS_BY_NAME:
+                external_refs.append({"file": str(pb), "type": "playbook_name", "ref": sub_name})
+                continue
             if sub_name not in symbol_table["playbooks_by_name"]:
                 missing.append({"file": str(pb), "type": "playbook_name", "ref": sub_name})
 
         for scr in parsed["refs"]["scripts"]:
+            if scr in PLATFORM_SCRIPTS:
+                platform_refs.append({"file": str(pb), "type": "script", "ref": scr})
+                continue
             if scr not in symbol_table["scripts_by_name"]:
                 missing.append({"file": str(pb), "type": "script", "ref": scr})
 
@@ -100,15 +116,19 @@ def doctor() -> int:
             "id_mappings": len(id_map),
             "impacted_repo_playbooks": len(impacted_repo_playbooks),
             "missing_refs": len(missing),
+            "platform_refs": len(platform_refs),
+            "external_refs": len(external_refs),
         },
         "missing": missing,
+        "platform": platform_refs,
+        "external": external_refs,
+        "impacted_repo_playbooks": [str(p) for p in impacted_repo_playbooks],
     }
 
     out = OUTPUT_DIR / "doctor_report.json"
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
-
     print(f"Wrote: {out}")
-    print(f"Missing refs: {len(missing)}")
+    print(f"Missing refs: {len(missing)} | Platform refs: {len(platform_refs)} | External refs: {len(external_refs)}")
     return 0
 
 
@@ -288,6 +308,7 @@ def promote(force: bool = False, dry_run: bool = False) -> int:
     # IMPORTANT: Build after_graph *after* rewriting dependents in temp_repo
     after_graph = build_repo_graph(temp_repo)
 
+    # Restrict graph comparison to only what we touched (staged + impacted)
     focus_nodes = set()
 
     # staged playbooks ids

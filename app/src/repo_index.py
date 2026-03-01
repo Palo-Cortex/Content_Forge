@@ -6,43 +6,59 @@ from typing import Any, Dict, List
 from app.src.yaml_utils import load_yaml
 
 
-def iter_playbook_files(root: Path) -> List[Path]:
+def iter_playbook_files(root: Path):
     """
-    If root is a repo root (contains Packs/), iterate all playbooks in Packs/*/Playbooks/*.yml.
-    If root is a pack root (contains Playbooks/), iterate Playbooks/*.yml.
-    Returns a sorted list of Paths.
+    Walk entire repo (or pack) and return all playbook YAML files.
     """
-    root = Path(root)
+    results = []
 
-    packs_dir = root / "Packs"
-    if packs_dir.exists() and packs_dir.is_dir():
-        return sorted(packs_dir.glob("*/Playbooks/*.yml"))
+    for yml in root.glob("**/*.yml"):
+        try:
+            doc = load_yaml(yml)
+        except Exception:
+            continue
 
-    pb_dir = root / "Playbooks"
-    if pb_dir.exists() and pb_dir.is_dir():
-        return sorted(pb_dir.glob("*.yml"))
+        if not isinstance(doc, dict):
+            continue
 
-    return []
+        if doc.get("type") == "playbook":
+            results.append(yml)
+            continue
+
+        if isinstance(doc.get("tasks"), dict) and "name" in doc and "id" in doc:
+            results.append(yml)
+
+    return sorted(results)
 
 
 def _iter_script_files(root: Path) -> List[Path]:
     """
-    If root is a repo root, iterate Packs/*/Scripts/**/*.yml.
-    If root is a pack root, iterate Scripts/**/*.yml.
+    Accepts:
+      - repo root: contains Packs/
+      - Packs root: is the Packs/ directory
+      - pack root: contains Scripts/
+    Returns all script YAML files.
     """
     root = Path(root)
 
-    packs_dir = root / "Packs"
-    if packs_dir.exists() and packs_dir.is_dir():
-        return sorted(packs_dir.glob("*/Scripts/**/*.yml"))
-
+    # Case 1: pack root
     scripts_dir = root / "Scripts"
     if scripts_dir.exists() and scripts_dir.is_dir():
-        return sorted(scripts_dir.glob("**/*.yml"))
+        paths = list(scripts_dir.glob("**/*.yml")) + list(scripts_dir.glob("**/*.yaml"))
+        return sorted(paths)
+
+    # Case 2: Packs root
+    if root.name == "Packs" and root.exists() and root.is_dir():
+        paths = list(root.glob("*/Scripts/**/*.yml")) + list(root.glob("*/Scripts/**/*.yaml"))
+        return sorted(paths)
+
+    # Case 3: repo root
+    packs_dir = root / "Packs"
+    if packs_dir.exists() and packs_dir.is_dir():
+        paths = list(packs_dir.glob("*/Scripts/**/*.yml")) + list(packs_dir.glob("*/Scripts/**/*.yaml"))
+        return sorted(paths)
 
     return []
-
-
 def build_symbol_table(root: Path) -> Dict[str, Any]:
     """
     Symbol table for playbooks & scripts.
