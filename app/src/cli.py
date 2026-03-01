@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import shutil
 import sys
@@ -25,15 +26,84 @@ from app.src.graph import (
 BASE_DIR = Path(os.environ.get("BASE_DIR", Path.cwd()))
 
 REPO_DIR = Path(os.environ.get("REPO_DIR", BASE_DIR / "secops-framework"))
-INGEST_DIR = Path(os.environ.get("INGEST_DIR", BASE_DIR / "ingest"))
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", BASE_DIR / "output"))
+INGEST_SUBMISSION = os.environ.get("INGEST_SUBMISSION", "").strip()
+
+# Ingest
+DEFAULT_INGEST_DIR = BASE_DIR / "ingest"
+if INGEST_SUBMISSION:
+    INGEST_DIR = Path(os.environ.get("INGEST_DIR", DEFAULT_INGEST_DIR / "submissions" / INGEST_SUBMISSION))
+else:
+    INGEST_DIR = Path(os.environ.get("INGEST_DIR", DEFAULT_INGEST_DIR))
+
+# Output (namespaced by submission to avoid collisions)
+DEFAULT_OUTPUT_DIR = BASE_DIR / "output"
+if INGEST_SUBMISSION:
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", DEFAULT_OUTPUT_DIR / "submissions" / INGEST_SUBMISSION))
+else:
+    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
+
 TARGET_PACK = os.environ.get("TARGET_PACK", "soc-optimization-unified")
 STAGING_PACK = os.environ.get("STAGING_PACK", f"{TARGET_PACK}_ingest")
+
+# ------------------------------------------------------------
+# Repo-global acceptance controls
+# ------------------------------------------------------------
+# Default: exclude fixtures packs from repo-impact checks unless explicitly testing.
+INCLUDE_FIXTURES = os.environ.get("INCLUDE_FIXTURES", "0").strip() == "1"
+_DEFAULT_EXCLUDE = "content-forge-fixtures,content-forge-fixtures_ingest"
+_excl_raw = os.environ.get("EXCLUDE_PACKS", "" if INCLUDE_FIXTURES else _DEFAULT_EXCLUDE)
+EXCLUDE_PACKS = {p.strip() for p in _excl_raw.split(",") if p.strip()}
+
+# Never exclude the active target/staging packs (avoid self-exclusion when testing fixtures)
+EXCLUDE_PACKS.discard(TARGET_PACK)
+EXCLUDE_PACKS.discard(STAGING_PACK)
+
 
 
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
+def _resolve_output_dir() -> Path:
+    """Resolve OUTPUT_DIR per submission to avoid collisions.
+
+    If OUTPUT_DIR is explicitly set in env, treat it as the root and still namespace
+    under OUTPUT_DIR/submissions/<submission> when INGEST_SUBMISSION is set.
+    """
+    base = Path(os.environ.get("BASE_DIR", Path.cwd()))
+    default_root = base / "output"
+
+    out_root = Path(os.environ.get("OUTPUT_DIR", str(default_root)))
+    submission = os.environ.get("INGEST_SUBMISSION", "").strip()
+
+    if submission:
+        # If caller already pointed OUTPUT_DIR at a submission folder, honor it.
+        out_str = str(out_root).replace("\\", "/")
+        if out_str.endswith(f"/submissions/{submission}") or out_str.endswith(f"submissions/{submission}"):
+            return out_root
+        return out_root / "submissions" / submission
+
+    return out_root
+
+
+def _find_quoted_header_ids(playbook_path: Path, max_lines: int = 80) -> bool:
+    """Return True if playbook header contains a quoted id: value (id: "..." or id: '...')."""
+    try:
+        lines = playbook_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return False
+    for line in lines[:max_lines]:
+        # Stop early once tasks begin (header finished)
+        if line.startswith("tasks:"):
+            break
+        if re.match(r'^id:\s*["\']', line.strip()):
+            return True
+    return False
+
+
+def _is_in_excluded_pack(path: Path) -> bool:
+    p = str(path).replace("\\", "/")
+    return any(f"/Packs/{name}/" in p for name in EXCLUDE_PACKS)
 
 def _stage_fresh_playbooks(staging_root: Path) -> list[Path]:
     staging_playbooks_dir = staging_root / "Playbooks"
@@ -51,6 +121,8 @@ def _stage_fresh_playbooks(staging_root: Path) -> list[Path]:
 # ------------------------------------------------------------
 
 def doctor() -> int:
+    global OUTPUT_DIR
+    OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pack_root = REPO_DIR / "Packs" / TARGET_PACK
@@ -65,6 +137,7 @@ def doctor() -> int:
     repo_playbooks = [
         p for p in list(iter_playbook_files(REPO_DIR))
         if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
+        and not _is_in_excluded_pack(p)
     ]
 
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
@@ -137,6 +210,8 @@ def doctor() -> int:
 # ------------------------------------------------------------
 
 def fix() -> int:
+    global OUTPUT_DIR
+    OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pack_root = REPO_DIR / "Packs" / TARGET_PACK
@@ -171,6 +246,18 @@ def fix() -> int:
     print("Running internal fixer...")
     changed = run_fixes(REPO_DIR, validate_out)
     print(f"Files modified: {changed}")
+    # --------------------------------------------------
+    # Guardrail: prevent quoted id: in playbook headers (causes key churn)
+    # --------------------------------------------------
+    quoted = [str(pb) for pb in staged_playbooks if _find_quoted_header_ids(pb)]
+    if quoted:
+        outp = OUTPUT_DIR / "quoted_id_playbooks.json"
+        outp.write_text(json.dumps(quoted, indent=2), encoding="utf-8")
+        print("ABORTING: Detected quoted id: in playbook header(s). See:", outp)
+        for q in quoted:
+            print("  -", q)
+        return 6
+
 
     code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
     (OUTPUT_DIR / "fix_validate_output_after.txt").write_text(validate_out, encoding="utf-8")
@@ -188,6 +275,8 @@ def fix() -> int:
 # ------------------------------------------------------------
 
 def promote(force: bool = False, dry_run: bool = False) -> int:
+    global OUTPUT_DIR
+    OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     pack_root = REPO_DIR / "Packs" / TARGET_PACK
@@ -260,6 +349,9 @@ def promote(force: bool = False, dry_run: bool = False) -> int:
         p for p in iter_playbook_files(REPO_DIR)
         if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
     ]
+
+    # Ignore excluded packs for repo-impact checks
+    repo_playbooks = [p for p in repo_playbooks if not _is_in_excluded_pack(p)]
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
     old_ids = set(id_map.keys())
 
@@ -422,6 +514,66 @@ def promote(force: bool = False, dry_run: bool = False) -> int:
 # Entry
 # ------------------------------------------------------------
 
+
+
+# ------------------------------------------------------------
+# Accept (doctor + fix + promote wrapper)
+# ------------------------------------------------------------
+
+def accept(apply: bool = False) -> int:
+    global OUTPUT_DIR
+    OUTPUT_DIR = _resolve_output_dir()
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("Running doctor...")
+    d_code = doctor()
+    if d_code != 0:
+        print("Doctor failed.")
+        return d_code
+
+    # Read doctor report
+    doctor_report_path = OUTPUT_DIR / "doctor_report.json"
+    doctor_report = {}
+    if doctor_report_path.exists():
+        import json
+        doctor_report = json.loads(doctor_report_path.read_text(encoding="utf-8"))
+
+    missing = doctor_report.get("counts", {}).get("missing_refs", 0)
+    if missing > 0:
+        print(f"Blocking accept: {missing} missing refs.")
+        return 4
+
+    print("Running fix...")
+    f_code = fix()
+    if f_code != 0:
+        print("Fix/validate failed.")
+        return f_code
+
+    print("Running promote...")
+    promote_code = promote(force=False, dry_run=not apply)
+    if promote_code != 0:
+        print("Promote failed.")
+        return promote_code
+
+    # Write acceptance receipt
+    receipt = {
+        "target_pack": TARGET_PACK,
+        "staging_pack": STAGING_PACK,
+        "apply": apply,
+        "doctor_counts": doctor_report.get("counts", {}),
+        "receipt_version": 1,
+          "submission": INGEST_SUBMISSION if "INGEST_SUBMISSION" in globals() and INGEST_SUBMISSION else None,
+    }
+
+    import json
+    receipt_path = OUTPUT_DIR / "acceptance_receipt.json"
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    print(f"Acceptance receipt written to: {receipt_path}")
+    print("ACCEPT complete.")
+    return 0
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("Usage: python -m app.src.cli <command> [--force]")
@@ -429,6 +581,15 @@ def main() -> int:
         return 2
 
     cmd = sys.argv[1].lower()
+
+    # accept: doctor + fix + promote wrapper
+
+    if cmd == "accept":
+
+        apply = "--apply" in sys.argv
+
+        return accept(apply=apply)
+
     force = "--force" in sys.argv[2:]
     dry_run = "--dry-run" in sys.argv[2:]
     if cmd == "doctor":
