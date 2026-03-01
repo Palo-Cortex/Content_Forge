@@ -64,6 +64,35 @@ EXCLUDE_PACKS.discard(STAGING_PACK)
 # Helpers
 # ------------------------------------------------------------
 
+def _resolve_ingest_dir() -> Path:
+    """Resolve INGEST_DIR per submission.
+
+    If INGEST_DIR is set:
+      - absolute: treat as ingest root
+      - relative: treat as BASE_DIR/<INGEST_DIR>
+    If INGEST_SUBMISSION is set, namespace under <root>/submissions/<submission>,
+    unless the provided INGEST_DIR already points to that submission folder.
+    """
+    base = Path(os.environ.get("BASE_DIR", Path.cwd()))
+    default_root = base / "ingest"
+
+    raw = os.environ.get("INGEST_DIR", "")
+    if raw:
+        root = Path(raw)
+        if not root.is_absolute():
+            root = base / root
+    else:
+        root = default_root
+
+    sub = os.environ.get("INGEST_SUBMISSION", "").strip()
+    if sub:
+        root_str = str(root).replace("\\", "/")
+        if root_str.endswith(f"/submissions/{sub}") or root_str.endswith(f"submissions/{sub}"):
+            return root
+        return root / "submissions" / sub
+
+    return root
+
 def _resolve_output_dir() -> Path:
     """Resolve OUTPUT_DIR per submission to avoid collisions.
 
@@ -121,6 +150,8 @@ def _stage_fresh_playbooks(staging_root: Path) -> list[Path]:
 # ------------------------------------------------------------
 
 def doctor() -> int:
+    global INGEST_DIR
+    INGEST_DIR = _resolve_ingest_dir()
     global OUTPUT_DIR
     OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -210,6 +241,8 @@ def doctor() -> int:
 # ------------------------------------------------------------
 
 def fix() -> int:
+    global INGEST_DIR
+    INGEST_DIR = _resolve_ingest_dir()
     global OUTPUT_DIR
     OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -275,6 +308,8 @@ def fix() -> int:
 # ------------------------------------------------------------
 
 def promote(force: bool = False, dry_run: bool = False) -> int:
+    global INGEST_DIR
+    INGEST_DIR = _resolve_ingest_dir()
     global OUTPUT_DIR
     OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -521,6 +556,8 @@ def promote(force: bool = False, dry_run: bool = False) -> int:
 # ------------------------------------------------------------
 
 def accept(apply: bool = False) -> int:
+    global INGEST_DIR
+    INGEST_DIR = _resolve_ingest_dir()
     global OUTPUT_DIR
     OUTPUT_DIR = _resolve_output_dir()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
