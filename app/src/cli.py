@@ -1,179 +1,145 @@
+from __future__ import annotations
+
 import json
-import re
 import os
 import shutil
 import sys
 from pathlib import Path
 
-from app.src.fixer import run_fixes
+from app.src.diff import compute_diff, hash_playbooks
+from app.src.graph import build_repo_graph, compare_graphs, simulate_repo_with_staging
 from app.src.impact import find_pack_playbooks_referencing_ids
+from app.src.integrity import analyze_playbook_integrity
 from app.src.normalize import normalize_pack
 from app.src.playbook_refs import is_playbook_yaml, parse_playbook_refs
+from app.src.platform_allowlist import DEFAULT_ALLOWLIST
 from app.src.repo_index import build_symbol_table, iter_playbook_files
 from app.src.rewrite import apply_mapping_across_files, build_id_normalization_map
 from app.src.sdk_gate import run_validate
+from app.src.semantic_diff import semantic_diff, snapshot_playbook
 from app.src.staging import ensure_staging_pack, stage_ingest_playbooks
-from app.src.diff import hash_playbooks, compute_diff
-from app.src.integrity import analyze_playbook_integrity
-from app.src.semantic_diff import snapshot_playbook, semantic_diff
-from app.src.platform_allowlist import DEFAULT_ALLOWLIST
-from app.src.graph import (
-    build_repo_graph,
-    compare_graphs,
-    simulate_repo_with_staging,
-)
-
-BASE_DIR = Path(os.environ.get("BASE_DIR", Path.cwd()))
-
-REPO_DIR = Path(os.environ.get("REPO_DIR", BASE_DIR / "secops-framework"))
-INGEST_SUBMISSION = os.environ.get("INGEST_SUBMISSION", "").strip()
-
-# Ingest
-DEFAULT_INGEST_DIR = BASE_DIR / "ingest"
-if INGEST_SUBMISSION:
-    INGEST_DIR = Path(os.environ.get("INGEST_DIR", DEFAULT_INGEST_DIR / "submissions" / INGEST_SUBMISSION))
-else:
-    INGEST_DIR = Path(os.environ.get("INGEST_DIR", DEFAULT_INGEST_DIR))
-
-# Output (namespaced by submission to avoid collisions)
-DEFAULT_OUTPUT_DIR = BASE_DIR / "output"
-if INGEST_SUBMISSION:
-    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", DEFAULT_OUTPUT_DIR / "submissions" / INGEST_SUBMISSION))
-else:
-    OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", DEFAULT_OUTPUT_DIR))
-
-TARGET_PACK = os.environ.get("TARGET_PACK", "soc-optimization-unified")
-STAGING_PACK = os.environ.get("STAGING_PACK", f"{TARGET_PACK}_ingest")
-
-# ------------------------------------------------------------
-# Repo-global acceptance controls
-# ------------------------------------------------------------
-# Default: exclude fixtures packs from repo-impact checks unless explicitly testing.
-INCLUDE_FIXTURES = os.environ.get("INCLUDE_FIXTURES", "0").strip() == "1"
-_DEFAULT_EXCLUDE = "content-forge-fixtures,content-forge-fixtures_ingest"
-_excl_raw = os.environ.get("EXCLUDE_PACKS", "" if INCLUDE_FIXTURES else _DEFAULT_EXCLUDE)
-EXCLUDE_PACKS = {p.strip() for p in _excl_raw.split(",") if p.strip()}
-
-# Never exclude the active target/staging packs (avoid self-exclusion when testing fixtures)
-EXCLUDE_PACKS.discard(TARGET_PACK)
-EXCLUDE_PACKS.discard(STAGING_PACK)
+from app.src.fixer import heal_playbooks_min_fromversion
 
 
+# -------------------------
+# Path resolution
+# -------------------------
 
-# ------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------
+def _resolve_submission() -> str:
+    return (os.environ.get("INGEST_SUBMISSION") or os.environ.get("SUBMISSION") or "default").strip() or "default"
+
 
 def _resolve_ingest_dir() -> Path:
-    """Resolve INGEST_DIR per submission.
-
-    If INGEST_DIR is set:
-      - absolute: treat as ingest root
-      - relative: treat as BASE_DIR/<INGEST_DIR>
-    If INGEST_SUBMISSION is set, namespace under <root>/submissions/<submission>,
-    unless the provided INGEST_DIR already points to that submission folder.
-    """
-    base = Path(os.environ.get("BASE_DIR", Path.cwd()))
-    default_root = base / "ingest"
-
-    raw = os.environ.get("INGEST_DIR", "")
+    sub = _resolve_submission()
+    raw = os.environ.get("INGEST_DIR") or os.environ.get("ingest_dir")
     if raw:
-        root = Path(raw)
-        if not root.is_absolute():
-            root = base / root
-    else:
-        root = default_root
+        return Path(raw)
+    return Path("/workspace/ingest") / sub
 
-    sub = os.environ.get("INGEST_SUBMISSION", "").strip()
-    if sub:
-        root_str = str(root).replace("\\", "/")
-        if root_str.endswith(f"/submissions/{sub}") or root_str.endswith(f"submissions/{sub}"):
-            return root
-        return root / "submissions" / sub
 
-    return root
+def _resolve_staging_dir() -> Path:
+    sub = _resolve_submission()
+    raw = os.environ.get("STAGING_DIR") or os.environ.get("staging_dir")
+    if raw:
+        p = Path(raw)
+        return p if p.name == sub else p / sub
+    return Path("/workspace/staging") / sub
+
 
 def _resolve_output_dir() -> Path:
-    """Resolve OUTPUT_DIR per submission to avoid collisions.
+    sub = _resolve_submission()
+    raw = os.environ.get("OUTPUT_DIR") or os.environ.get("output_dir")
+    if raw:
+        p = Path(raw)
+        return p if p.name == sub else p / sub
+    return Path("/workspace/output") / sub
 
-    If OUTPUT_DIR is explicitly set in env, treat it as the root and still namespace
-    under OUTPUT_DIR/submissions/<submission> when INGEST_SUBMISSION is set.
-    """
-    base = Path(os.environ.get("BASE_DIR", Path.cwd()))
-    default_root = base / "output"
 
-    out_root = Path(os.environ.get("OUTPUT_DIR", str(default_root)))
-    submission = os.environ.get("INGEST_SUBMISSION", "").strip()
+def _repo_dir() -> Path:
+    return Path(os.environ.get("REPO_DIR") or "/workspace/secops-framework")
 
-    if submission:
-        # If caller already pointed OUTPUT_DIR at a submission folder, honor it.
-        out_str = str(out_root).replace("\\", "/")
-        if out_str.endswith(f"/submissions/{submission}") or out_str.endswith(f"submissions/{submission}"):
-            return out_root
-        return out_root / "submissions" / submission
 
-    return out_root
+def _target_pack() -> str:
+    return os.environ.get("TARGET_PACK", "soc-optimization-unified")
+
+
+def _staging_pack() -> str:
+    target = _target_pack()
+    return os.environ.get("STAGING_PACK", f"{target}_ingest")
+
+
+def _exclude_packs() -> set[str]:
+    include_fixtures = os.environ.get("INCLUDE_FIXTURES", "0").strip() == "1"
+    default_exclude = "content-forge-fixtures,content-forge-fixtures_ingest"
+    raw = os.environ.get("EXCLUDE_PACKS", "" if include_fixtures else default_exclude)
+    s = {p.strip() for p in raw.split(",") if p.strip()}
+    s.discard(_target_pack())
+    s.discard(_staging_pack())
+    return s
+
+
+def _is_in_excluded_pack(path: Path) -> bool:
+    p = str(path).replace("\\", "/")
+    for name in _exclude_packs():
+        if f"/Packs/{name}/" in p:
+            return True
+    return False
 
 
 def _find_quoted_header_ids(playbook_path: Path, max_lines: int = 80) -> bool:
-    """Return True if playbook header contains a quoted id: value (id: "..." or id: '...')."""
     try:
         lines = playbook_path.read_text(encoding="utf-8").splitlines()
     except Exception:
         return False
     for line in lines[:max_lines]:
-        # Stop early once tasks begin (header finished)
         if line.startswith("tasks:"):
             break
-        if re.match(r'^id:\s*["\']', line.strip()):
+        if line.strip().startswith("id:") and ('"' in line or "'" in line):
             return True
     return False
 
 
-def _is_in_excluded_pack(path: Path) -> bool:
-    p = str(path).replace("\\", "/")
-    return any(f"/Packs/{name}/" in p for name in EXCLUDE_PACKS)
-
-def _stage_fresh_playbooks(staging_root: Path) -> list[Path]:
-    staging_playbooks_dir = staging_root / "Playbooks"
-
-    if staging_playbooks_dir.exists():
-        shutil.rmtree(staging_playbooks_dir)
-    staging_playbooks_dir.mkdir(parents=True, exist_ok=True)
-
-    staged_files = stage_ingest_playbooks(INGEST_DIR, staging_playbooks_dir)
-    return [p for p in staged_files if is_playbook_yaml(p)]
-
-
-# ------------------------------------------------------------
-# Doctor (analysis only, no mutation)
-# ------------------------------------------------------------
+# -------------------------
+# Commands
+# -------------------------
 
 def doctor() -> int:
-    global INGEST_DIR
-    INGEST_DIR = _resolve_ingest_dir()
-    global OUTPUT_DIR
-    OUTPUT_DIR = _resolve_output_dir()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    repo_dir = _repo_dir()
+    ingest_dir = _resolve_ingest_dir()
+    staging_dir = _resolve_staging_dir()
+    output_dir = _resolve_output_dir()
 
-    pack_root = REPO_DIR / "Packs" / TARGET_PACK
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    target_pack = _target_pack()
+    staging_pack = _staging_pack()
+
+    pack_root = repo_dir / "Packs" / target_pack
     if not pack_root.exists():
         print(f"[ERROR] Target pack not found: {pack_root}")
         return 2
 
-    staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
-    staged_playbooks = _stage_fresh_playbooks(staging_root)
+    staging_pack_root = ensure_staging_pack(staging_dir, staging_pack)
+
+    # Stage (read-only behavior relative to ingest; we overwrite staging playbooks each time)
+    staging_playbooks_dir = staging_pack_root / "Playbooks"
+    if staging_playbooks_dir.exists():
+        shutil.rmtree(staging_playbooks_dir)
+    staging_playbooks_dir.mkdir(parents=True, exist_ok=True)
+
+    staged_paths = stage_ingest_playbooks(ingest_dir, staging_playbooks_dir)
+    staged_playbooks = [p for p in staged_paths if is_playbook_yaml(p)]
 
     pack_playbooks = list(iter_playbook_files(pack_root))
     repo_playbooks = [
-        p for p in list(iter_playbook_files(REPO_DIR))
-        if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
+        p for p in list(iter_playbook_files(repo_dir))
+        if f"/Packs/{staging_pack}/" not in str(p).replace("\\", "/")
         and not _is_in_excluded_pack(p)
     ]
 
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
     old_ids = set(id_map.keys())
-
     impacted_repo_playbooks = find_pack_playbooks_referencing_ids(repo_playbooks, old_ids)
 
     missing: list[dict] = []
@@ -181,13 +147,10 @@ def doctor() -> int:
     external_refs: list[dict] = []
 
     allow = DEFAULT_ALLOWLIST
-    symbol_table = build_symbol_table(REPO_DIR / "Packs")
+    symbol_table = build_symbol_table(repo_dir / "Packs")
 
-    # Backwards-compatible aliases (doctor may reference these names)
-    allow = DEFAULT_ALLOWLIST
-    PLATFORM_SCRIPTS = allow.platform_scripts
-    EXTERNAL_PLAYBOOKS_BY_NAME = allow.external_playbooks_by_name
-
+    platform_scripts = allow.platform_scripts
+    external_playbooks_by_name = allow.external_playbooks_by_name
 
     for pb in staged_playbooks:
         parsed = parse_playbook_refs(pb)
@@ -197,14 +160,14 @@ def doctor() -> int:
                 missing.append({"file": str(pb), "type": "playbook_id", "ref": sub_id})
 
         for sub_name in parsed["refs"]["playbooks_by_name"]:
-            if sub_name in EXTERNAL_PLAYBOOKS_BY_NAME:
+            if sub_name in external_playbooks_by_name:
                 external_refs.append({"file": str(pb), "type": "playbook_name", "ref": sub_name})
                 continue
             if sub_name not in symbol_table["playbooks_by_name"]:
                 missing.append({"file": str(pb), "type": "playbook_name", "ref": sub_name})
 
         for scr in parsed["refs"]["scripts"]:
-            if scr in PLATFORM_SCRIPTS:
+            if scr in platform_scripts:
                 platform_refs.append({"file": str(pb), "type": "script", "ref": scr})
                 continue
             if scr not in symbol_table["scripts_by_name"]:
@@ -212,8 +175,9 @@ def doctor() -> int:
 
     report = {
         "mode": "doctor",
-        "target_pack": TARGET_PACK,
-        "staging_pack": STAGING_PACK,
+        "target_pack": target_pack,
+        "staging_pack": staging_pack,
+        "submission": _resolve_submission(),
         "counts": {
             "staged_playbooks": len(staged_playbooks),
             "pack_playbooks": len(pack_playbooks),
@@ -229,33 +193,43 @@ def doctor() -> int:
         "impacted_repo_playbooks": [str(p) for p in impacted_repo_playbooks],
     }
 
-    out = OUTPUT_DIR / "doctor_report.json"
+    out = output_dir / "doctor_report.json"
     out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"Wrote: {out}")
     print(f"Missing refs: {len(missing)} | Platform refs: {len(platform_refs)} | External refs: {len(external_refs)}")
     return 0
 
 
-# ------------------------------------------------------------
-# Fix (mutates staging only)
-# ------------------------------------------------------------
-
 def fix() -> int:
-    global INGEST_DIR
-    INGEST_DIR = _resolve_ingest_dir()
-    global OUTPUT_DIR
-    OUTPUT_DIR = _resolve_output_dir()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    repo_dir = _repo_dir()
+    ingest_dir = _resolve_ingest_dir()
+    staging_dir = _resolve_staging_dir()
+    output_dir = _resolve_output_dir()
 
-    pack_root = REPO_DIR / "Packs" / TARGET_PACK
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
+    target_pack = _target_pack()
+    staging_pack = _staging_pack()
+
+    pack_root = repo_dir / "Packs" / target_pack
     if not pack_root.exists():
         print(f"[ERROR] Target pack not found: {pack_root}")
         return 2
 
-    staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
-    staged_playbooks = _stage_fresh_playbooks(staging_root)
+    staging_pack_root = ensure_staging_pack(staging_dir, staging_pack)
 
-    pack_playbooks = iter_playbook_files(pack_root)
+    # Always restage fresh from ingest
+    staging_playbooks_dir = staging_pack_root / "Playbooks"
+    if staging_playbooks_dir.exists():
+        shutil.rmtree(staging_playbooks_dir)
+    staging_playbooks_dir.mkdir(parents=True, exist_ok=True)
+
+    staged_paths = stage_ingest_playbooks(ingest_dir, staging_playbooks_dir)
+    staged_playbooks = [p for p in staged_paths if is_playbook_yaml(p)]
+
+    # Normalize IDs and references on staged playbooks
+    pack_playbooks = list(iter_playbook_files(pack_root))
     id_map = build_id_normalization_map(pack_playbooks + staged_playbooks)
 
     if id_map:
@@ -267,83 +241,69 @@ def fix() -> int:
 
     apply_mapping_across_files(staged_playbooks, id_map)
 
-    normalize_pack(staging_root, staged_playbooks)
+    # Normalize pack boilerplate + playbook headers
+    normalize_pack(staging_pack_root, staged_playbooks)
 
-    code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
-    (OUTPUT_DIR / "fix_validate_output.txt").write_text(validate_out, encoding="utf-8")
+    # Deterministic BA106 healing on staged playbooks (prevents promote loop)
+    healed = heal_playbooks_min_fromversion(staged_playbooks, min_version="5.0.0")
+    if healed:
+        print(f"Healed fromversion on {healed} staged playbook(s).")
 
-    if code == 0:
-        print("Nothing to fix. Staging validate clean.")
-        return 0
-
-    print("Running internal fixer...")
-    changed = run_fixes(REPO_DIR, validate_out)
-    print(f"Files modified: {changed}")
-    # --------------------------------------------------
-    # Guardrail: prevent quoted id: in playbook headers (causes key churn)
-    # --------------------------------------------------
+    # Guardrail: prevent quoted id: in playbook headers
     quoted = [str(pb) for pb in staged_playbooks if _find_quoted_header_ids(pb)]
     if quoted:
-        outp = OUTPUT_DIR / "quoted_id_playbooks.json"
+        outp = output_dir / "quoted_id_playbooks.json"
         outp.write_text(json.dumps(quoted, indent=2), encoding="utf-8")
         print("ABORTING: Detected quoted id: in playbook header(s). See:", outp)
         for q in quoted:
             print("  -", q)
         return 6
 
-
-    code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
-    (OUTPUT_DIR / "fix_validate_output_after.txt").write_text(validate_out, encoding="utf-8")
+    # Validate staging pack (must be clean to promote)
+    code, validate_out = run_validate(staging_dir, f"Packs/{staging_pack}")
+    (output_dir / "fix_validate_output.txt").write_text(validate_out, encoding="utf-8")
 
     if code != 0:
-        print("Still failing after fix.")
+        print(validate_out)
+        print("Staging validate FAILED after fix.")
         return code
 
     print("Fix successful. Staging pack clean.")
     return 0
 
 
-# ------------------------------------------------------------
-# Promote (safe promotion with diff + optional force)
-# ------------------------------------------------------------
-
 def promote(force: bool = False, dry_run: bool = False) -> int:
-    global INGEST_DIR
-    INGEST_DIR = _resolve_ingest_dir()
-    global OUTPUT_DIR
-    OUTPUT_DIR = _resolve_output_dir()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    repo_dir = _repo_dir()
+    staging_dir = _resolve_staging_dir()
+    output_dir = _resolve_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    pack_root = REPO_DIR / "Packs" / TARGET_PACK
+    target_pack = _target_pack()
+    staging_pack = _staging_pack()
+
+    pack_root = repo_dir / "Packs" / target_pack
     if not pack_root.exists():
         print(f"[ERROR] Target pack not found: {pack_root}")
         return 2
 
-    staging_root = ensure_staging_pack(REPO_DIR, STAGING_PACK)
-    staging_playbooks_dir = staging_root / "Playbooks"
-
+    staging_pack_root = ensure_staging_pack(staging_dir, staging_pack)
+    staging_playbooks_dir = staging_pack_root / "Playbooks"
     if not staging_playbooks_dir.exists():
         print("[ERROR] Staging Playbooks missing. Run `fix` first.")
         return 2
 
-    staged_playbooks = [
-        p for p in staging_playbooks_dir.glob("*.yml") if is_playbook_yaml(p)
-    ]
+    staged_playbooks = [p for p in sorted(staging_playbooks_dir.glob("*.yml")) if is_playbook_yaml(p)]
 
-    # --------------------------------------------------
-    # Validate staging pack
-    # --------------------------------------------------
-    code, validate_out = run_validate(REPO_DIR, f"Packs/{STAGING_PACK}")
+    # Validate staging pack before promoting (should already be clean)
+    code, validate_out = run_validate(staging_dir, f"Packs/{staging_pack}")
+    (output_dir / "promote_validate_staging.txt").write_text(validate_out, encoding="utf-8")
     if code != 0:
         print("Staging validate FAILED. Run fix first.")
         return code
 
-    # --------------------------------------------------
     # Diff safety
-    # --------------------------------------------------
     before_hashes = hash_playbooks(pack_root)
-    after_hashes = hash_playbooks(staging_root)
-
+    after_hashes = hash_playbooks(staging_pack_root)
     diff = compute_diff(before_hashes, after_hashes)
     total_changes = len(diff["added"]) + len(diff["modified"])
 
@@ -353,214 +313,135 @@ def promote(force: bool = False, dry_run: bool = False) -> int:
         "unchanged": diff["unchanged"],
         "total_changes": total_changes,
     }
-
-    diff_path = OUTPUT_DIR / "promotion_diff.json"
+    diff_path = output_dir / "promotion_diff.json"
     diff_path.write_text(json.dumps(diff_report, indent=2), encoding="utf-8")
-
     print(f"Promotion diff written to: {diff_path}")
     print(f"Total Changes: {total_changes}")
 
-    MAX_ALLOWED_CHANGES = 20
-
-    if total_changes > MAX_ALLOWED_CHANGES and not force:
+    max_allowed = int(os.environ.get("MAX_ALLOWED_CHANGES", "20"))
+    if total_changes > max_allowed and not force:
         print(f"ABORTING: Too many changes ({total_changes})")
         print("Re-run with --force to override.")
         return 3
 
-    # --------------------------------------------------
-    # Repository Graph Integrity Check (SIMULATED)
-    # --------------------------------------------------
-    # --------------------------------------------------
-    # Repository Graph Integrity Check (SIMULATED)
-    # --------------------------------------------------
+    # Graph integrity simulation
     print("Running repository graph integrity check...")
+    before_graph = build_repo_graph(repo_dir)
+    temp_repo = simulate_repo_with_staging(repo_dir, staging_pack_root)
 
-    before_graph = build_repo_graph(REPO_DIR)
-
-    temp_repo = simulate_repo_with_staging(REPO_DIR, staging_root)
-
-    # ---- Apply ID→Name mapping to impacted playbooks in the TEMP repo ----
     repo_playbooks = [
-        p for p in iter_playbook_files(REPO_DIR)
-        if f"/Packs/{STAGING_PACK}/" not in str(p).replace("\\", "/")
+        p for p in iter_playbook_files(repo_dir)
+        if f"/Packs/{staging_pack}/" not in str(p).replace("\\", "/")
     ]
-
-    # Ignore excluded packs for repo-impact checks
     repo_playbooks = [p for p in repo_playbooks if not _is_in_excluded_pack(p)]
+
     id_map = build_id_normalization_map(repo_playbooks + staged_playbooks)
     old_ids = set(id_map.keys())
-
     impacted_repo_playbooks = find_pack_playbooks_referencing_ids(repo_playbooks, old_ids)
 
-    # Map impacted real paths to their equivalents in temp_repo and rewrite there
+    # Rewrite dependents in temp repo for graph check only
     temp_impacted: list[Path] = []
     for p in impacted_repo_playbooks:
         try:
-            rel = p.relative_to(REPO_DIR)
+            rel = p.relative_to(repo_dir)
         except ValueError:
             continue
         tp = temp_repo / rel
         if tp.exists():
             temp_impacted.append(tp)
 
-    dependent_changes = []
     if temp_impacted and id_map:
-        dependent_changes = apply_mapping_across_files(temp_impacted, id_map)
+        _ = apply_mapping_across_files(temp_impacted, id_map)
 
-    # ---- Write reports for visibility ----
-    impacted_report = {
-        "id_map_count": len(id_map),
-        "impacted_repo_playbooks_count": len(impacted_repo_playbooks),
-        "impacted_repo_playbooks": [str(p) for p in impacted_repo_playbooks],
-        "temp_impacted_count": len(temp_impacted),
-        "temp_impacted": [str(p) for p in temp_impacted],
-        "dependent_changes_count": len(dependent_changes),
-    }
-    (OUTPUT_DIR / "impacted_dependents.json").write_text(
-        json.dumps(impacted_report, indent=2),
-        encoding="utf-8",
-    )
-    (OUTPUT_DIR / "dependent_rewrite_changes.json").write_text(
-        json.dumps([c.__dict__ for c in dependent_changes], indent=2),
-        encoding="utf-8",
-    )
-
-    # ---- Policy: if dependents exist, abort unless --force ----
     if impacted_repo_playbooks and not force and id_map:
         print("Detected dependent playbooks that reference old IDs.")
-        print(f"Wrote: {OUTPUT_DIR / 'impacted_dependents.json'}")
+        (output_dir / "impacted_dependents.json").write_text(
+            json.dumps([str(p) for p in impacted_repo_playbooks], indent=2),
+            encoding="utf-8",
+        )
         print("ABORTING (run with --force to proceed).")
         return 6
 
-    # IMPORTANT: Build after_graph *after* rewriting dependents in temp_repo
     after_graph = build_repo_graph(temp_repo)
 
-    # Restrict graph comparison to only what we touched (staged + impacted)
     focus_nodes = set()
-
-    # staged playbooks ids
     for pb in staged_playbooks:
         d = parse_playbook_refs(pb)
         if d.get("id"):
             focus_nodes.add(str(d["id"]))
-
-    # impacted dependents ids (repo originals)
     for p in impacted_repo_playbooks:
         d = parse_playbook_refs(p)
         if d.get("id"):
             focus_nodes.add(str(d["id"]))
 
     broken = compare_graphs(before_graph, after_graph, focus_nodes=focus_nodes)
-
     if broken:
         print("Graph integrity violation detected:")
         for b in broken:
             print(b)
         print("ABORTING due to broken dependency edges.")
         return 4
-
     print("Graph integrity check passed.")
 
+    # Semantic diff
     semantic_report = {}
-
+    real_pb_dir = pack_root / "Playbooks"
     for pb in staged_playbooks:
-        real_path = pack_root / "Playbooks" / pb.name
-
+        real_path = real_pb_dir / pb.name
         if real_path.exists():
             before_snap = snapshot_playbook(real_path)
             after_snap = snapshot_playbook(pb)
-
-            diff = semantic_diff(before_snap, after_snap)
-
-            if any(
-                    diff[k]
-                    for k in diff
-            ):
-                semantic_report[pb.name] = diff
+            d = semantic_diff(before_snap, after_snap)
+            if any(d[k] for k in d):
+                semantic_report[pb.name] = d
         else:
             semantic_report[pb.name] = {"new_playbook": True}
 
-    semantic_path = OUTPUT_DIR / "semantic_diff.json"
-    semantic_path.write_text(
-        json.dumps(semantic_report, indent=2),
-        encoding="utf-8",
-    )
-
+    semantic_path = output_dir / "semantic_diff.json"
+    semantic_path.write_text(json.dumps(semantic_report, indent=2), encoding="utf-8")
     print(f"Semantic diff written to: {semantic_path}")
 
-
-    # --------------------------------------------------
-    # Playbook Integrity Check
-    # --------------------------------------------------
+    # Integrity report
     print("Running playbook integrity checks...")
-
     integrity_report = {}
     hard_fail = False
-
     for pb in staged_playbooks:
-        real_path = pack_root / "Playbooks" / pb.name
-
+        real_path = real_pb_dir / pb.name
         if real_path.exists():
             integrity = analyze_playbook_integrity(real_path, pb)
-
-            # Hard fail condition
             if integrity.get("dangling_old_id_reference"):
                 hard_fail = True
-
-            # Record if anything interesting changed
             if any(integrity.values()):
                 integrity_report[pb.name] = integrity
 
-    integrity_path = OUTPUT_DIR / "integrity_report.json"
-    integrity_path.write_text(
-        json.dumps(integrity_report, indent=2),
-        encoding="utf-8"
-    )
-
+    integrity_path = output_dir / "integrity_report.json"
+    integrity_path.write_text(json.dumps(integrity_report, indent=2), encoding="utf-8")
     print(f"Integrity report written to: {integrity_path}")
 
     if hard_fail:
         print("ABORTING: Dangling old playbook ID detected.")
         return 5
 
-
-    # --------------------------------------------------
-    # COPY INTO REAL PACK  (REAL MUTATION POINT)
-    # --------------------------------------------------
     if dry_run:
         print("DRY RUN: skipping copy into real pack and final pack validate.")
         return 0
 
-    real_pb_dir = pack_root / "Playbooks"
+    # Copy staged playbooks into repo pack (real mutation point)
     real_pb_dir.mkdir(parents=True, exist_ok=True)
-
     for pb in staged_playbooks:
         shutil.copy2(pb, real_pb_dir / pb.name)
 
-    # Final validate
-    final_code, final_out = run_validate(REPO_DIR, f"Packs/{TARGET_PACK}")
+    # Final validate of target pack in repo (should pass; promote does not "fix")
+    final_code, final_out = run_validate(repo_dir, f"Packs/{target_pack}")
+    (output_dir / "promote_validate_repo.txt").write_text(final_out, encoding="utf-8")
     print(final_out)
     print(f"Final validate exit code: {final_code}")
-
     return final_code
 
 
-# ------------------------------------------------------------
-# Entry
-# ------------------------------------------------------------
-
-
-
-# ------------------------------------------------------------
-# Accept (doctor + fix + promote wrapper)
-# ------------------------------------------------------------
-
 def accept(apply: bool = False) -> int:
-    global INGEST_DIR
-    INGEST_DIR = _resolve_ingest_dir()
-    global OUTPUT_DIR
-    OUTPUT_DIR = _resolve_output_dir()
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_dir = _resolve_output_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Running doctor...")
     d_code = doctor()
@@ -568,11 +449,9 @@ def accept(apply: bool = False) -> int:
         print("Doctor failed.")
         return d_code
 
-    # Read doctor report
-    doctor_report_path = OUTPUT_DIR / "doctor_report.json"
+    doctor_report_path = output_dir / "doctor_report.json"
     doctor_report = {}
     if doctor_report_path.exists():
-        import json
         doctor_report = json.loads(doctor_report_path.read_text(encoding="utf-8"))
 
     missing = doctor_report.get("counts", {}).get("missing_refs", 0)
@@ -592,20 +471,17 @@ def accept(apply: bool = False) -> int:
         print("Promote failed.")
         return promote_code
 
-    # Write acceptance receipt
     receipt = {
-        "target_pack": TARGET_PACK,
-        "staging_pack": STAGING_PACK,
+        "target_pack": _target_pack(),
+        "staging_pack": _staging_pack(),
         "apply": apply,
         "doctor_counts": doctor_report.get("counts", {}),
         "receipt_version": 1,
-          "submission": INGEST_SUBMISSION if "INGEST_SUBMISSION" in globals() and INGEST_SUBMISSION else None,
+        "submission": _resolve_submission(),
     }
 
-    import json
-    receipt_path = OUTPUT_DIR / "acceptance_receipt.json"
+    receipt_path = output_dir / "acceptance_receipt.json"
     receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
-
     print(f"Acceptance receipt written to: {receipt_path}")
     print("ACCEPT complete.")
     return 0
@@ -613,22 +489,19 @@ def accept(apply: bool = False) -> int:
 
 def main() -> int:
     if len(sys.argv) < 2:
-        print("Usage: python -m app.src.cli <command> [--force]")
-        print("Commands: doctor, fix, promote")
+        print("Usage: python -m app.src.cli <command> [--force] [--dry-run] [--apply]")
+        print("Commands: doctor, fix, promote, accept")
         return 2
 
     cmd = sys.argv[1].lower()
 
-    # accept: doctor + fix + promote wrapper
-
     if cmd == "accept":
-
-        apply = "--apply" in sys.argv
-
+        apply = "--apply" in sys.argv[2:]
         return accept(apply=apply)
 
     force = "--force" in sys.argv[2:]
     dry_run = "--dry-run" in sys.argv[2:]
+
     if cmd == "doctor":
         return doctor()
     if cmd == "fix":
